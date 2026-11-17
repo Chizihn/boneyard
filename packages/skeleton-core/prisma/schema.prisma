@@ -1,0 +1,144 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  requester
+  provider
+  admin
+}
+
+enum Vertical {
+  hallowear
+  haint
+}
+
+// REQUESTED -> MATCHED -> ACCEPTED -> IN_PROGRESS -> COMPLETED
+//                                   -> DISPUTED -> RESOLVED
+// REQUESTED/MATCHED -> CANCELLED
+enum RequestStatus {
+  REQUESTED
+  MATCHED
+  ACCEPTED
+  IN_PROGRESS
+  COMPLETED
+  DISPUTED
+  RESOLVED
+  CANCELLED
+}
+
+enum DisputeStatus {
+  open
+  resolved
+}
+
+enum PaymentStatus {
+  held
+  released
+  refunded
+}
+
+model User {
+  id       String  @id @default(uuid())
+  role     Role
+  email    String  @unique
+  password String
+  name     String
+  // provider-only: null for requester/admin. A provider must be approved
+  // before their listings are eligible for matching (see auth-spec).
+  providerApprovedAt DateTime?
+
+  listings Listing[] @relation("ProviderListings")
+  requests Request[] @relation("RequesterRequests")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Listing {
+  id         String   @id @default(uuid())
+  providerId String
+  provider   User     @relation("ProviderListings", fields: [providerId], references: [id])
+  vertical   Vertical
+  title      String
+  // vertical-specific fields live here, never as new columns/tables:
+  // Hallowear -> { size, category }; Haint -> { capacity, timeSlots }.
+  metadata   Json
+  location   Json
+  active     Boolean  @default(true)
+
+  requests        Request[]
+  matchCandidates MatchCandidate[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Request {
+  id              String        @id @default(uuid())
+  requesterId     String
+  requester       User          @relation("RequesterRequests", fields: [requesterId], references: [id])
+  listingId       String
+  listing         Listing       @relation(fields: [listingId], references: [id])
+  vertical        Vertical
+  status          RequestStatus @default(REQUESTED)
+  windowStart     DateTime
+  windowEnd       DateTime
+  amount          Decimal       @db.Decimal(10, 2)
+
+  matchCandidates MatchCandidate[]
+  dispute         Dispute?
+  payment         Payment?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Kept even for non-selected candidates so the "why this provider" ranking
+// decision is auditable, not just the winner.
+model MatchCandidate {
+  id         String  @id @default(uuid())
+  requestId  String
+  request    Request @relation(fields: [requestId], references: [id])
+  listingId  String
+  listing    Listing @relation(fields: [listingId], references: [id])
+  rank       Int
+  distance   Float
+  eligible   Boolean
+
+  createdAt DateTime @default(now())
+}
+
+model Dispute {
+  id        String        @id @default(uuid())
+  requestId String        @unique
+  request   Request       @relation(fields: [requestId], references: [id])
+  raisedBy  String
+  status    DisputeStatus @default(open)
+  resolution String?
+  // Set by the atomic claim (UPDATE ... WHERE status = 'open') before any
+  // refund logic runs, so two admins can't both resolve the same dispute.
+  claimedByAdminId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Payment {
+  id        String        @id @default(uuid())
+  requestId String        @unique
+  request   Request       @relation(fields: [requestId], references: [id])
+  amount    Decimal       @db.Decimal(10, 2)
+  status    PaymentStatus @default(held)
+  // Pre-discount amount. Refunds are always computed against this, never
+  // the discounted total the requester actually paid.
+  baseAmount Decimal      @db.Decimal(10, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
