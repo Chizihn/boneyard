@@ -37,10 +37,13 @@ export interface AuthUser {
   providerApprovedAt: Date | null;
 }
 
-/** Returned by login — includes the signed JWT alongside the user record. */
+/** Returned by login — includes a short-lived access token and a rotatable refresh token. */
 export interface LoginResult {
   user: AuthUser;
-  token: string;
+  /** Short-lived JWT (15 min). Stateless — verify with `verifyToken`. */
+  accessToken: string;
+  /** Long-lived opaque token (30 days). Store securely; rotated on every use. */
+  refreshToken: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +89,19 @@ export class NotAProviderError extends Error {
   constructor(userId: string) {
     super(`User "${userId}" is not a provider and cannot be approved.`);
     this.name = "NotAProviderError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/**
+ * Covers not-found, expired, AND already-revoked refresh tokens.
+ * Unified message — don't leak which specific condition failed,
+ * same reasoning as `InvalidCredentialsError`.
+ */
+export class InvalidRefreshTokenError extends Error {
+  constructor() {
+    super("Refresh token is invalid or has expired.");
+    this.name = "InvalidRefreshTokenError";
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }

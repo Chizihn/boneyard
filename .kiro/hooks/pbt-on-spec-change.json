@@ -1,0 +1,16 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "PBT on spec change",
+      "trigger": "PostFileSave",
+      "description": "Runs the skeleton-core test suite whenever matching-spec.md or payments-dispute-spec.md is saved. Blocks further changes (exit 2) if any test fails.",
+      "matcher": "\\.kiro/specs/(matching-spec|payments-dispute-spec)\\.md$",
+      "action": {
+        "type": "command",
+        "command": "cd \"$(dirname \"$0\" | sed 's|/.kiro.*||')\" 2>/dev/null || cd /home/chizihn/Desktop/Boneyard; echo \"=== pbt-on-spec-change: spec file saved, running skeleton-core tests ===\" >&2; if pnpm --filter @boneyard/skeleton-core test; then   echo \"=== Tests passed — safe to continue ===\" >&2;   exit 0; else   echo \"=== BLOCKED: skeleton-core tests failed after spec change. Fix tests before continuing. ===\" >&2;   exit 2; fi",
+        "timeout": 120
+      }
+    }
+  ]
+}

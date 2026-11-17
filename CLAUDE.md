@@ -42,8 +42,81 @@ instead of rebuilt per project.
 
 ## Current status
 
-Planning complete, no code written yet. Next step: write the four skeleton
-specs described in `docs/KIRO-PLAN.md`, then start the backend in Kiro.
+Monorepo scaffolded (pnpm workspace, `skeleton-core`'s Prisma schema
+migrated against a local Postgres container). All four skeleton specs are
+done: `auth-spec`, `order-state-spec`, `matching-spec`, and
+`payments-dispute-spec` have all been run through Kiro, with their
+generated code in `packages/skeleton-core/src/` and the specs themselves
+saved in `.kiro/specs/`. Steering docs for all five domain rules are in
+`.kiro/steering/`, and the `pbt-on-spec-change` hook is wired and verified.
+`skeleton-core` passes a full typecheck and 202 tests (`pnpm --filter
+@boneyard/skeleton-core test`).
+
+`backend/api` (NestJS, built directly rather than through Kiro — see the
+division of labor this assistant and the author agreed on, driven by
+limited Kiro credit) now covers the full endpoint surface: auth, listings
+(CRUD + matching-engine-powered search), requests (create/accept/start/
+complete/cancel/dispute, wired to the order-state machine and payments),
+and admin (provider approval queue, dispute claim/resolve, activity feed).
+Passes a full typecheck and 27 e2e tests against the real Postgres
+container (`pnpm --filter @boneyard/api test`) — including a genuine
+8-concurrent-request burst proving the Haint slot-capacity atomic guard
+holds under real load, not just in `skeleton-core`'s isolated tests.
+
+Two real bugs were caught and fixed via this live testing (not just
+typecheck/unit tests): a provider's bcrypt password hash was leaking
+through `/listings/search` and `/admin/providers/pending` (both fixed with
+explicit Prisma `select`s — worth grepping for `include: { provider: true }`
+/ `include: { requester: true }` / bare `prisma.user.findMany` again if
+new endpoints touch user relations); and a NestJS+Vitest decorator-metadata
+gap (esbuild doesn't implement `emitDecoratorMetadata`) that silently broke
+both DI and `ValidationPipe` under the test runner — fixed via explicit
+`@Inject()` everywhere and an SWC-based vitest transform
+(`backend/api/vitest.config.ts`).
+
+`backend/api` also now has: Swagger docs at `/docs` (full `@ApiProperty`
+coverage on every DTO, `@ApiBearerAuth` wired), Helmet security headers,
+CORS via `CORS_ORIGIN` (comma-separated allowlist or `*`, defaults to a
+localhost-only allowlist if unset — see `main.ts`), a `/health` check
+(DB-connectivity probe, excluded from Swagger), and fail-fast env
+validation (`src/config/env.validation.ts` — a too-short `JWT_SECRET` or
+missing `DATABASE_URL` now aborts startup with a clear message instead of
+booting and failing confusingly on the first request). Default port is
+4000 (`backend/api/.env`).
+
+Auth now has access+refresh tokens (`auth-spec-refresh-tokens` addendum,
+run through Kiro) — 15-min access tokens, 30-day rotating refresh tokens,
+`POST /auth/refresh` + `POST /auth/logout`. Review caught a real
+concurrency bug in Kiro's rotation logic (unconditional `update` instead
+of a guarded `updateMany` — same bug class as the `resolveDispute`
+double-submit fixed earlier); fixed, with a `fast-check` property test
+confirmed to actually catch the regression.
+
+Payments are fully real now, both legs — **Bachs** Connect for payout
+(`PaymentSettlementService`) and real checkout sessions + real refunds for
+the charge side (`CheckoutService`), both confirmed asynchronously via a
+signed webhook (`POST /webhooks/bachs`). `Request`/`Payment` only reach
+`MATCHED`/`held` once the webhook actually confirms payment — see
+`.kiro/steering/payment-settlement-idempotency.md` for the atomic-claim +
+webhook-dedup patterns (informed by reading Eatovr's integration and the
+real docs.bachs.io refund API, not copying either). The payout side still
+no-ops gracefully if a provider hasn't connected a Bachs account — that's
+a real "not onboarded" state, not a simulation. `BACHS_SECRET_KEY`/
+`BACHS_WEBHOOK_SECRET` still need real values in `.env` to hit the actual
+sandbox; the test suite fakes only the Bachs HTTP boundary.
+
+Note: Gemini has been working in this same repo concurrently (adding
+`NotificationsModule`/push notifications). It added two simulation
+fallbacks that directly contradicted the "no simulations" instruction
+above — removed both; flagged in `docs/TRACKER.md` since there's no live
+channel to Gemini to confirm it saw this.
+
+`skeleton-core` is at 212 tests, `backend/api` at 57+ (growing — Gemini's
+notification tests included), full `pnpm build` clean across both. See
+`docs/TRACKER.md` for the full done/remaining breakdown.
+
+Next: the two thin app specs (`hallowear-spec`, `haint-spec`) via Kiro, or
+the MCP scaffold tool / actual Expo app shells.
 
 ## Ground rules
 

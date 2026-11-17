@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { PrismaClient, Role } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
@@ -9,11 +10,14 @@ import {
   InvalidRoleError,
   DuplicateEmailError,
   InvalidCredentialsError,
+  InvalidRefreshTokenError,
   ProviderNotFoundError,
   NotAProviderError,
 } from "./auth.types";
 
 const BCRYPT_ROUNDS = 12;
+const ACCESS_TOKEN_TTL = "15m";
+const REFRESH_TOKEN_TTL_DAYS = 30;
 
 /** Roles that cannot be self-selected at signup. */
 const ADMIN_ONLY_ROLES: Set<Role> = new Set([Role.admin]);
@@ -32,6 +36,20 @@ function toAuthUser(user: {
     role: user.role,
     providerApprovedAt: user.providerApprovedAt,
   };
+}
+
+function hashToken(raw: string): string {
+  return crypto.createHash("sha256").update(raw).digest("hex");
+}
+
+function mintRawRefreshToken(): string {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function refreshTokenExpiresAt(): Date {
+  const d = new Date();
+  d.setDate(d.getDate() + REFRESH_TOKEN_TTL_DAYS);
+  return d;
 }
 
 export class AuthService {
@@ -66,7 +84,6 @@ export class AuthService {
         password: passwordHash,
         name: input.name,
         role: input.role as Role,
-        // Providers start unapproved — providerApprovedAt stays null
         providerApprovedAt: null,
       },
     });
@@ -76,10 +93,10 @@ export class AuthService {
 
   /**
    * Authenticates a user by email + password.
-   * Returns the `AuthUser` and a signed JWT that includes the user's role.
-   * The backend reads role from the token — never trusts a client-sent role.
-   * Throws `InvalidCredentialsError` on bad email or password (unified message
-   * to avoid leaking whether the email exists).
+   * Returns a short-lived access token (15 min JWT) and a long-lived
+   * refresh token (30 days, stored hashed in DB).
+   * Throws `InvalidCredentialsError` on bad email or password — unified
+   * message to avoid leaking whether the email exists.
    */
   async login(input: LoginInput): Promise<LoginResult> {
     const user = await this.prisma.user.findUnique({
@@ -95,25 +112,74 @@ export class AuthService {
     }
 
     const authUser = toAuthUser(user);
+    const { accessToken, refreshToken } = await this.issueTokenPair(user.id, authUser);
 
-    const token = jwt.sign(
-      {
-        sub: user.id,
-        email: user.email,
-        role: user.role,
-      },
-      this.jwtSecret,
-      { expiresIn: "7d" }
-    );
-
-    return { user: authUser, token };
+    return { user: authUser, accessToken, refreshToken };
   }
 
   /**
-   * Verifies a JWT and returns the decoded `AuthUser`.
-   * Throws `JsonWebTokenError` / `TokenExpiredError` from the jsonwebtoken
-   * library on invalid or expired tokens — the HTTP layer should map these to
-   * 401 responses.
+   * Rotates a refresh token.
+   * - Hashes the incoming raw token and looks it up by `tokenHash`.
+   * - Throws `InvalidRefreshTokenError` if not found, already revoked, or expired.
+   * - On success: atomically claims the row (guarded `updateMany` on
+   *   `revokedAt: null`, not a plain `update` by id) before issuing a
+   *   fresh pair. The guard is what actually makes replay-after-rotation
+   *   safe under real concurrency: two genuinely simultaneous calls with
+   *   the same token both pass the initial read-only check above (neither
+   *   has written yet), so the exclusivity has to come from the atomic
+   *   claim itself, not from the earlier read. Whichever call's claim
+   *   affects 0 rows loses the race and throws — the same pattern
+   *   `logout()` below already uses, and the same pattern
+   *   DisputeService.claimDispute uses in the payments module.
+   */
+  async refreshTokens(rawRefreshToken: string): Promise<LoginResult> {
+    const tokenHash = hashToken(rawRefreshToken);
+
+    const stored = await this.prisma.refreshToken.findUnique({
+      where: { tokenHash },
+      include: { user: true },
+    });
+
+    if (!stored || stored.revokedAt !== null || stored.expiresAt < new Date()) {
+      throw new InvalidRefreshTokenError();
+    }
+
+    const authUser = toAuthUser(stored.user);
+
+    const { accessToken, refreshToken } = await this.prisma.$transaction(async (tx) => {
+      const claim = await tx.refreshToken.updateMany({
+        where: { id: stored.id, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      if (claim.count === 0) {
+        throw new InvalidRefreshTokenError();
+      }
+      return this.issueTokenPairTx(tx, stored.userId, authUser);
+    });
+
+    return { user: authUser, accessToken, refreshToken };
+  }
+
+  /**
+   * Revokes a refresh token so it can no longer be rotated.
+   * Idempotent — does not throw if the token doesn't exist or is already revoked.
+   * Logout must never leak whether a token was valid.
+   */
+  async logout(rawRefreshToken: string): Promise<void> {
+    const tokenHash = hashToken(rawRefreshToken);
+
+    await this.prisma.refreshToken.updateMany({
+      where: { tokenHash, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+    // updateMany silently affects 0 rows when not found or already revoked — that's correct.
+  }
+
+  /**
+   * Verifies an access token JWT and returns the decoded `AuthUser`.
+   * Access tokens are stateless — no DB lookup here by design.
+   * Throws `JsonWebTokenError` / `TokenExpiredError` from jsonwebtoken on
+   * invalid or expired tokens; the HTTP layer maps these to 401.
    */
   async verifyToken(token: string): Promise<AuthUser> {
     const payload = jwt.verify(token, this.jwtSecret) as {
@@ -122,8 +188,7 @@ export class AuthService {
       role: Role;
     };
 
-    // Re-fetch from DB so the role and approval state are always fresh,
-    // not stale data baked into the token at sign time.
+    // Re-fetch from DB so role and approval state are always current.
     const user = await this.prisma.user.findUnique({
       where: { id: payload.sub },
     });
@@ -136,10 +201,7 @@ export class AuthService {
 
   /**
    * Flips a provider account from unapproved → approved.
-   * This is the single admin action described in auth-spec §"Provider approval gate".
-   * - Throws `ProviderNotFoundError` if the user doesn't exist.
-   * - Throws `NotAProviderError` if the user is not a provider.
-   * - Idempotent: calling it on an already-approved provider is a no-op.
+   * Idempotent: no-op if already approved.
    */
   async approveProvider(providerId: string): Promise<AuthUser> {
     const user = await this.prisma.user.findUnique({
@@ -153,7 +215,6 @@ export class AuthService {
     }
 
     if (user.providerApprovedAt !== null) {
-      // Already approved — idempotent, no DB write needed
       return toAuthUser(user);
     }
 
@@ -163,5 +224,47 @@ export class AuthService {
     });
 
     return toAuthUser(updated);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private helpers
+  // ---------------------------------------------------------------------------
+
+  /** Issues an access + refresh token pair outside a transaction. */
+  private async issueTokenPair(
+    userId: string,
+    authUser: AuthUser
+  ): Promise<{ accessToken: string; refreshToken: string }> {
+    return this.issueTokenPairTx(this.prisma, userId, authUser);
+  }
+
+  /**
+   * Issues an access + refresh token pair using the given Prisma client
+   * (may be a transaction client). Called by both `login` and
+   * `refreshTokens`.
+   */
+  private async issueTokenPairTx(
+    tx: Omit<PrismaClient, "$connect" | "$disconnect" | "$on" | "$transaction" | "$use" | "$extends"> | PrismaClient,
+    userId: string,
+    authUser: AuthUser
+  ): Promise<{ accessToken: string; refreshToken: string }> {
+    const accessToken = jwt.sign(
+      { sub: authUser.id, email: authUser.email, role: authUser.role },
+      this.jwtSecret,
+      { expiresIn: ACCESS_TOKEN_TTL }
+    );
+
+    const rawRefreshToken = mintRawRefreshToken();
+    const tokenHash = hashToken(rawRefreshToken);
+
+    await (tx as PrismaClient).refreshToken.create({
+      data: {
+        userId,
+        tokenHash,
+        expiresAt: refreshTokenExpiresAt(),
+      },
+    });
+
+    return { accessToken, refreshToken: rawRefreshToken };
   }
 }

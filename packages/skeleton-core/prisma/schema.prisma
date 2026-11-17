@@ -38,8 +38,16 @@ enum DisputeStatus {
 }
 
 enum PaymentStatus {
+  // Checkout session created, requester hasn't completed (or Bachs hasn't
+  // confirmed) payment yet. The Request stays REQUESTED, not MATCHED,
+  // while a Payment is in this state.
+  pending_checkout
   held
   released
+  // Bachs refund created (HTTP response was "processing") but not yet
+  // confirmed by the refund.paid webhook. Symmetric to pending_checkout —
+  // refund creation is asynchronous on Bachs's side too.
+  pending_refund
   refunded
 }
 
@@ -52,12 +60,67 @@ model User {
   // provider-only: null for requester/admin. A provider must be approved
   // before their listings are eligible for matching (see auth-spec).
   providerApprovedAt DateTime?
+  // provider-only: set once the provider completes Bachs Connect
+  // onboarding. Payment release can only make a real provider payout once
+  // this is set — see .kiro/steering/payment-settlement-idempotency.md.
+  bachsAccountId String?
 
-  listings Listing[] @relation("ProviderListings")
-  requests Request[] @relation("RequesterRequests")
+  notificationPreferences Json?          @default("{\"pushEnabled\": true}")
+
+  listings      Listing[]      @relation("ProviderListings")
+  requests      Request[]      @relation("RequesterRequests")
+  refreshTokens RefreshToken[]
+  pushTokens    UserPushToken[]
+  notifications Notification[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model UserPushToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  platform  String?
+  appType   String?
+  deviceId  String?
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([userId, active])
+}
+
+model Notification {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  body      String
+  type      String
+  data      Json?
+  isRead    Boolean   @default(false)
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([userId, isRead])
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id])
+  // SHA-256 hex digest of the raw token — never store the raw token.
+  // High-entropy random input means a fast deterministic hash is correct here;
+  // unlike passwords there is no low-entropy brute-force risk to defend against.
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
 }
 
 model Listing {
@@ -120,6 +183,9 @@ model Dispute {
   request   Request       @relation(fields: [requestId], references: [id])
   raisedBy  String
   status    DisputeStatus @default(open)
+  // Why the dispute was raised (requester/provider-supplied, at raise time).
+  // Distinct from `resolution`, which is the admin's closing note.
+  reason    String?
   resolution String?
   // Set by the atomic claim (UPDATE ... WHERE status = 'open') before any
   // refund logic runs, so two admins can't both resolve the same dispute.
@@ -134,11 +200,41 @@ model Payment {
   requestId String        @unique
   request   Request       @relation(fields: [requestId], references: [id])
   amount    Decimal       @db.Decimal(10, 2)
-  status    PaymentStatus @default(held)
+  status    PaymentStatus @default(pending_checkout)
   // Pre-discount amount. Refunds are always computed against this, never
   // the discounted total the requester actually paid.
   baseAmount Decimal      @db.Decimal(10, 2)
+  // Null = not yet settled with a real provider in EITHER direction.
+  // "PENDING:<key>" while a Bachs transfer (payout) or refund call is in
+  // flight (the atomic claim guard — see
+  // .kiro/steering/payment-settlement-idempotency.md). The real Bachs
+  // transfer/refund id once it succeeds. Never reset to null on failure —
+  // a retry must resume under the same PENDING key, not mint a new one.
+  // Safe to share between payout and refund: a given Payment can only
+  // ever go through one of those two flows (the order-state machine makes
+  // them mutually exclusive — payout only from COMPLETED, refund only
+  // from pre-acceptance CANCELLED).
+  providerReference String?
+  // Bachs checkout session id/url, set when the checkout is created
+  // (before the requester has actually paid). The webhook looks the
+  // Payment up primarily by id (echoed back as metadata.paymentId), with
+  // this as a fallback correlation key.
+  checkoutSessionId String? @unique
+  checkoutUrl       String?
+  // Bachs's charge id, captured from the checkout-success webhook.
+  // Required to later call POST /v1/refunds — Bachs refunds reference a
+  // charge, not a checkout session.
+  chargeId          String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+// Dedupes Bachs webhook deliveries by their event id — providers routinely
+// retry webhook delivery (e.g. if we don't ack fast enough), so the same
+// event must never be processed twice. See
+// .kiro/steering/payment-settlement-idempotency.md.
+model ProcessedWebhookEvent {
+  id         String   @id
+  receivedAt DateTime @default(now())
 }
