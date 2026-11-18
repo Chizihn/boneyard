@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Inject, Optional, Param, Post, UseGuards } from "@nestjs/common";
+import { Body, Controller, Delete, Get, HttpCode, Inject, Optional, Param, Post, UseGuards } from "@nestjs/common";
 import { ApiBearerAuth, ApiOperation, ApiTags } from "@nestjs/swagger";
 import { AuthService, Role } from "@boneyard/skeleton-core";
 import type { AuthUser } from "@boneyard/skeleton-core";
@@ -6,6 +6,7 @@ import { NotificationsService } from "../notifications/notifications.service";
 import { SignupDto } from "./dto/signup.dto";
 import { LoginDto } from "./dto/login.dto";
 import { RefreshDto } from "./dto/refresh.dto";
+import { DeleteAccountDto } from "./dto/delete-account.dto";
 import { JwtAuthGuard } from "./guards/jwt-auth.guard";
 import { RolesGuard } from "./guards/roles.guard";
 import { Roles } from "./decorators/roles.decorator";
@@ -57,6 +58,17 @@ export class AuthController {
   @Get("me")
   me(@CurrentUser() user: AuthUser) {
     return user;
+  }
+
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: "Delete (soft) the current account — requires the current password to confirm",
+  })
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(204)
+  @Delete("me")
+  async deleteMe(@CurrentUser() user: AuthUser, @Body() dto: DeleteAccountDto) {
+    await this.authService.deleteAccount(user.id, dto.password);
   }
 
   // Admin-only: flips a provider from unapproved -> approved.

@@ -1,5 +1,6 @@
 docs/*
 .claude/
+sample/
 
 # dependencies
 node_modules/

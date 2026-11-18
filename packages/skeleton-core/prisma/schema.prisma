@@ -67,6 +67,14 @@ model User {
 
   notificationPreferences Json?          @default("{\"pushEnabled\": true}")
 
+  // Account deletion is a soft delete, not a hard DELETE: listings/
+  // requests have no onDelete: Cascade (Prisma defaults to Restrict for
+  // required relations), so a real delete would just FK-error for any
+  // account with history. Setting this anonymizes email/name/password
+  // and revokes all tokens; a non-null deletedAt must always be rejected
+  // at login, regardless of what else is still true about the row.
+  deletedAt DateTime?
+
   listings      Listing[]      @relation("ProviderListings")
   requests      Request[]      @relation("RequesterRequests")
   refreshTokens RefreshToken[]

@@ -102,7 +102,7 @@ export class AuthService {
     const user = await this.prisma.user.findUnique({
       where: { email: input.email },
     });
-    if (!user) {
+    if (!user || user.deletedAt) {
       throw new InvalidCredentialsError();
     }
 
@@ -192,11 +192,52 @@ export class AuthService {
     const user = await this.prisma.user.findUnique({
       where: { id: payload.sub },
     });
-    if (!user) {
+    if (!user || user.deletedAt) {
       throw new InvalidCredentialsError();
     }
 
     return toAuthUser(user);
+  }
+
+  /**
+   * Deletes (soft) the account: requires the current password as
+   * re-confirmation (standard for a destructive, irreversible action),
+   * then anonymizes PII and revokes every refresh token so no existing
+   * session — including the one making this call — survives it. Listings
+   * and requests are left as historical records (hard-deleting them would
+   * corrupt other users' order history); `deletedAt` is what every other
+   * read path must check instead.
+   */
+  async deleteAccount(userId: string, password: string): Promise<void> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user || user.deletedAt) {
+      throw new InvalidCredentialsError();
+    }
+
+    const passwordMatches = await bcrypt.compare(password, user.password);
+    if (!passwordMatches) {
+      throw new InvalidCredentialsError();
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.refreshToken.updateMany({
+        where: { userId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+      this.prisma.userPushToken.updateMany({
+        where: { userId, active: true },
+        data: { active: false },
+      }),
+      this.prisma.user.update({
+        where: { id: userId },
+        data: {
+          deletedAt: new Date(),
+          email: `deleted-${userId}@deleted.boneyard.invalid`,
+          name: "Deleted user",
+          password: crypto.randomBytes(32).toString("hex"),
+        },
+      }),
+    ]);
   }
 
   /**
