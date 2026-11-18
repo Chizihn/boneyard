@@ -38,6 +38,12 @@
       "expo-status-bar",
       "expo-web-browser",
       [
+        "expo-camera",
+        {
+          "cameraPermission": "Haint uses the camera to scan ticket QR codes for check-in."
+        }
+      ],
+      [
         "expo-location",
         {
           "locationWhenInUsePermission": "Haint uses your location to find haunted attractions near you."
